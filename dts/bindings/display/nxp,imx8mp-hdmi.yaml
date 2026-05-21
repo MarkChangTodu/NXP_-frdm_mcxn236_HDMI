@@ -1,0 +1,33 @@
+# Copyright 2026 NXP
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  NXP i.MX8MP HDMI subsystem.
+
+  This single binding describes the entire HDMI output path on i.MX8MP, which
+  consists of four MMIO regions inside the HDMIMIX domain:
+
+    - HDMI BLK_CTRL (0x32FC_0000): clock and reset controls for the HDMIMIX
+      sub-blocks (LCDIF3, HTX_PVI, HDMI TX, HDMI PHY).
+    - HTX_PVI       (0x32FC_4000): parallel video bridge between LCDIF3 and
+      the HDMI TX controller.
+    - HDMI TX       (0x32FD_8000): Synopsys DesignWare HDMI 2.0a controller.
+    - HDMI PHY      (0x32FD_FF00): HDMI TX PHY (PLL + serializer).
+
+  These blocks are tightly coupled and only ever used together as a single
+  display output pipeline, so they are intentionally exposed as one DT node.
+
+compatible: "nxp,imx8mp-hdmi"
+
+include: [base.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+    description: |
+      Four MMIO regions in this order: blk_ctrl, htx_pvi, hdmi_tx, hdmi_phy.
+
+  reg-names:
+    required: true
+    description: |
+      Must be ["blk_ctrl", "htx_pvi", "hdmi_tx", "hdmi_phy"].

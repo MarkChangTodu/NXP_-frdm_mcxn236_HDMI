@@ -1,0 +1,13 @@
+# Copyright 2026 NXP
+# SPDX-License-Identifier: Apache-2.0
+
+config IMX8MP_HDMI
+	bool "NXP i.MX8MP HDMI display driver"
+	default y
+	depends on DT_HAS_NXP_IMX8MP_HDMI_ENABLED
+	help
+	  Enable the NXP i.MX8MP HDMI display driver.
+
+	  This driver covers the full HDMI output pipeline (HDMI BLK_CTRL,
+	  HTX_PVI, Synopsys DesignWare HDMI TX controller and HDMI TX PHY)
+	  inside the i.MX8MP HDMIMIX domain.

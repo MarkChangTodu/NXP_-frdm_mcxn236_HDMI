@@ -349,6 +349,16 @@
 			compatible = "nxp,rdc";
 			reg = <0x303d0000 DT_SIZE_K(64)>;
 		};
+
+		hdmi: hdmi@32fc0000 {
+			compatible = "nxp,imx8mp-hdmi";
+			reg = <0x32fc0000 DT_SIZE_K(16)>,
+			      <0x32fc4000 DT_SIZE_K(4)>,
+			      <0x32fd8000 DT_SIZE_K(32)>,
+			      <0x32fdff00 0x100>;
+			reg-names = "blk_ctrl", "htx_pvi", "hdmi_tx", "hdmi_phy";
+			status = "disabled";
+		};
 	};
 };
 

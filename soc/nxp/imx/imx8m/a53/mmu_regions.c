@@ -40,6 +40,20 @@ static const struct arm_mmu_region mmu_regions[] = {
 			      DT_REG_SIZE(DT_NODELABEL(rdc)),
 			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_NS),
 
+	/* GPC: needed for raw HDMIMIX/HDMI_PHY power-up before driver init.
+	 * No DT node — accessed only by HDMI driver bring-up code.
+	 */
+	MMU_REGION_FLAT_ENTRY("GPC",
+			      0x303a0000, KB(64),
+			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_NS),
+
+	/* HDMIMIX: covers HDMI BLK_CTRL (0x32FC_0000) through HDMI TX PHY
+	 * (0x32FD_FFFF). 128KB single mapping serves all four HDMI MMIO regions.
+	 */
+	MMU_REGION_FLAT_ENTRY("HDMIMIX",
+			      0x32fc0000, KB(128),
+			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_NS),
+
 	MMU_REGION_DT_COMPAT_FOREACH_FLAT_ENTRY(nxp_imx_iuart,
 				  (MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_NS))
 };
