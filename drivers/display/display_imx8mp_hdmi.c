@@ -199,6 +199,37 @@ struct imx8mp_hdmi_config {
 #define IH_I2CM_DONE                BIT(1)
 #define IH_I2CM_ERROR               BIT(0)
 
+/*
+ * HDMI TX PHY register offsets (relative to hdmi_phy VA, base=0x32FDFF00).
+ * All registers are 8-bit; accessed via sys_read8/sys_write8.
+ * IMX8MPRM §13.10.3.1 (docs/subsystems/hdmi_tx_phy_13_10.md).
+ */
+#define HDMI_PHY_REG1_OFF    0x04  /* PMS_P pre-div, clock sel        reset=0xD1 */
+#define HDMI_PHY_REG2_OFF    0x08  /* PMS_M main-div [7:0]             reset=0x3E */
+#define HDMI_PHY_REG3_OFF    0x0C  /* PMS_S post-div, SDC_N            reset=0x15 */
+#define HDMI_PHY_REG4_OFF    0x10  /* SDM_K_EN, SDM_LC denominator     reset=0xC0 */
+#define HDMI_PHY_REG5_OFF    0x14  /* SDM_K_SIGN, SDM_K_CODE numerator reset=0x90 */
+#define HDMI_PHY_REG27_OFF   0x6C  /* sub-block RESETn (all active-HIGH) reset=0x00 */
+#define HDMI_PHY_REG28_OFF   0x70  /* power-down controls               reset=0x00 */
+#define HDMI_PHY_REG33_OFF   0x84  /* MODE_SET_DONE (bit7)              reset=0x80 */
+#define HDMI_PHY_REG34_OFF   0x88  /* status (RO)                       reset=0x00 */
+
+/* PHY_REG27 sub-block RESETn bits (1=run, 0=in reset). POR=0x00. */
+#define PHY_REG27_FLD_RSTN      BIT(7)
+#define PHY_REG27_SDC_RSTN      BIT(6)
+#define PHY_REG27_SDM_RSTN      BIT(5)
+#define PHY_REG27_NDIV_RSTN     BIT(4)
+#define PHY_REG27_MDIV_RSTN     BIT(3)
+#define PHY_REG27_PDIV_RSTN     BIT(2)
+#define PHY_REG27_AFC_PLL_RSTN  BIT(1)
+#define PHY_REG27_AFC_INIT_RSTN BIT(0)
+
+/* PHY_REG34 status bits (read-only). */
+#define PHY_REG34_PHY_READY   BIT(7)
+#define PHY_REG34_PLL_LOCK    BIT(6)
+#define PHY_REG34_PHY_CLK_RDY BIT(5)
+#define PHY_REG34_AFC_DONE    BIT(4)
+
 struct imx8mp_hdmi_data {
 	DEVICE_MMIO_NAMED_RAM(blk_ctrl);
 	DEVICE_MMIO_NAMED_RAM(htx_pvi);
@@ -391,6 +422,81 @@ static void imx8mp_hdmi_pinmux_readback(void)
 			pins[i].name, val, mux,
 			mux == 0 ? "ALT0 HDMIMIX OK" : "!! NOT ALT0");
 	}
+}
+
+/*
+ * Sub-goal 3.1: configure the HDMI TX PHY PLL for 148.5 MHz TMDS (1080p60)
+ * and wait for PLL_LOCK.
+ *
+ * PLL formula (integer + fractional-K):
+ *   F_PLL = F_REF × (M + K/LC) / (P × S)
+ * With F_REF=24 MHz, P=1 (REG1[3:0]=1), M=62 (REG2=0x3E),
+ *      S=2 (REG3[7:4]=0001), SDM_K_EN=1 (REG4[7]=1), LC=64 (REG4[6:0]=64):
+ *   K=0:   24 × 62 / 2 = 744.0 MHz → TMDS = 148.8 MHz (high by 0.2%)
+ *   K=-8:  24 × (62 - 8/64) / 2 = 742.5 MHz → TMDS = 148.5 MHz  ✓
+ *   K=-16: 24 × (62 - 16/64) / 2 = 741.0 MHz → TMDS = 148.2 MHz (default)
+ *
+ * Only REG5 differs from reset: SDM_K_SIGN=1(neg), SDM_K_CODE=8 → 0x88.
+ * (Default 0x90 = K=-16 → 148.2 MHz; correct value is 0x88 = K=-8.)
+ *
+ * After setting dividers, de-assert all sub-block resets via REG27=0xFF,
+ * then poll REG34 for PLL_LOCK (bit6) within 5 ms.
+ */
+static int imx8mp_hdmi_phy_pll_init(const struct device *dev)
+{
+	mm_reg_t hdmi_phy = DEVICE_MMIO_NAMED_GET(dev, hdmi_phy);
+	uint8_t val;
+	int i;
+
+	/* Read back current PLL config for diagnostics. */
+	printk("[hdmi_phy] REG1=0x%02x REG2=0x%02x REG3=0x%02x REG4=0x%02x REG5=0x%02x\n",
+	       sys_read8(hdmi_phy + HDMI_PHY_REG1_OFF),
+	       sys_read8(hdmi_phy + HDMI_PHY_REG2_OFF),
+	       sys_read8(hdmi_phy + HDMI_PHY_REG3_OFF),
+	       sys_read8(hdmi_phy + HDMI_PHY_REG4_OFF),
+	       sys_read8(hdmi_phy + HDMI_PHY_REG5_OFF));
+
+	/*
+	 * Correct fractional K for exact 148.5 MHz:
+	 * REG5 = 0x88: SDM_K_SIGN=1(negative), SDM_K_CODE=8
+	 * This gives K/LC = -8/64 = -0.125, F_PLL = 742.5 MHz.
+	 */
+	sys_write8(0x88, hdmi_phy + HDMI_PHY_REG5_OFF);
+
+	/*
+	 * De-assert all PHY PLL sub-block resets.
+	 * REG27 POR=0x00 (all in reset). Write 0xFF to release:
+	 * FLD(7)+SDC(6)+SDM(5)+NDIV(4)+MDIV(3)+PDIV(2)+AFC_PLL(1)+AFC_INIT(0).
+	 */
+	sys_write8(0xFF, hdmi_phy + HDMI_PHY_REG27_OFF);
+
+	/*
+	 * Poll REG34 for PLL_LOCK (bit6).
+	 * AFC typically completes within 500 µs; allow up to 5 ms (500 × 10 µs).
+	 */
+	for (i = 0; i < 500; i++) {
+		val = sys_read8(hdmi_phy + HDMI_PHY_REG34_OFF);
+		if (val & PHY_REG34_PLL_LOCK) {
+			break;
+		}
+		k_busy_wait(10);
+	}
+
+	printk("[hdmi_phy] REG34=0x%02x after %d×10µs:"
+	       " PHY_READY=%d PLL_LOCK=%d PHY_CLK_RDY=%d AFC_DONE=%d\n",
+	       val, i,
+	       !!(val & PHY_REG34_PHY_READY),
+	       !!(val & PHY_REG34_PLL_LOCK),
+	       !!(val & PHY_REG34_PHY_CLK_RDY),
+	       !!(val & PHY_REG34_AFC_DONE));
+
+	if (!(val & PHY_REG34_PLL_LOCK)) {
+		LOG_ERR("Goal 3.1 FAIL: PHY PLL did not lock (REG34=0x%02x)", val);
+		return -ETIMEDOUT;
+	}
+
+	printk("[hdmi_phy] Goal 3.1 PASS: PLL locked (148.5 MHz TMDS, 1080p60)\n");
+	return 0;
 }
 
 /* Sub-goal 2.2: HPD detect via phy_stat0[1]. Polled in a low-priority
@@ -632,6 +738,12 @@ static int imx8mp_hdmi_init(const struct device *dev)
 
 	imx8mp_hdmi_slave_readback(dev);
 	imx8mp_hdmi_pinmux_readback();
+
+	/* Sub-goal 3.1: configure PHY PLL for 148.5 MHz TMDS. */
+	ret = imx8mp_hdmi_phy_pll_init(dev);
+	if (ret) {
+		return ret;
+	}
 
 	/* Sub-goal 2.2: kick off HPD polling thread. */
 	k_thread_create(&hdmi_hpd_thread, hdmi_hpd_stack,
