@@ -126,4 +126,16 @@
 			input-enable;
 		};
 	};
+
+	pinmux_hdmi: pinmux_hdmi {
+		group0 {
+			pinmux = <&iomuxc_hdmi_ddc_scl_hdmi_scl_hdmi_scl>,
+				 <&iomuxc_hdmi_ddc_sda_hdmi_sda_hdmi_sda>,
+				 <&iomuxc_hdmi_cec_hdmi_cec_hdmi_cec>,
+				 <&iomuxc_hdmi_hpd_hdmi_hpd_hdmi_hpd>;
+			drive-strength = "x4";
+			slew-rate = "slow";
+			input-enable;
+		};
+	};
 };

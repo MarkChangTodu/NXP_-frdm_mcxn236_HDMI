@@ -96,6 +96,12 @@
 	status = "okay";
 };
 
+&hdmi {
+	pinctrl-0 = <&pinmux_hdmi>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
 &flexcan2 {
 	pinctrl-0 = <&flexcan2_default>;
 	pinctrl-names = "default";
