@@ -165,6 +165,40 @@ struct imx8mp_hdmi_config {
 #define HDMI_TX_PHY_STAT0_OFF             0x3004
 #define HDMI_TX_PHY_STAT0_HPD             BIT(1)
 
+/* E-DDC I2C master (for EDID reads). IMX8MPRM §13.9.3.12 (L237109-L237175).
+ * Base of EDDC register block is HDMI_TX + 0x7E00.
+ * All registers are 8-bit; accessed via sys_read8/sys_write8.
+ *
+ * Interrupt status: ih_i2cm_stat0 at HDMI_TX + 0x5 (IMX8MPRM §13.9.3.2.7,
+ * L228227-L228259). bit1 = done (W1C), bit0 = error (W1C).
+ */
+#define HDMI_TX_IH_I2CM_STAT0_OFF   0x0005  /* interrupt status (W1C) */
+#define HDMI_TX_I2CM_BASE           0x7E00
+#define I2CM_OFF(r)                 (HDMI_TX_I2CM_BASE + (r))
+#define I2CM_SLAVE_OFF              I2CM_OFF(0x00)  /* slave addr (7-bit) */
+#define I2CM_ADDRESS_OFF            I2CM_OFF(0x01)  /* register/byte addr */
+#define I2CM_DATAI_OFF              I2CM_OFF(0x03)  /* read data (RO) */
+#define I2CM_OPERATION_OFF          I2CM_OFF(0x04)  /* 0x01=single, 0x04=burst8 */
+#define I2CM_INT_OFF                I2CM_OFF(0x05)  /* done int config (reset=0x40) */
+#define I2CM_CTLINT_OFF             I2CM_OFF(0x06)  /* error int config */
+#define I2CM_DIV_OFF                I2CM_OFF(0x07)  /* clock divisor (reset=0x0B) */
+#define I2CM_SOFTRSTZ_OFF           I2CM_OFF(0x09)  /* soft reset: 0=rst, 1=run */
+/* SS SCL timing defaults give ~100kHz with sfr_clk. */
+#define I2CM_SS_SCL_HCNT_0_OFF     I2CM_OFF(0x0C)  /* reset=0x6C (108 cycles) */
+#define I2CM_SS_SCL_LCNT_0_OFF     I2CM_OFF(0x0E)  /* reset=0x7F (127 cycles) */
+/* 8-byte burst read result buffers (i2cm_read_buff0-7). */
+#define I2CM_READ_BUFF_BASE         I2CM_OFF(0x20)
+
+/* DDC slave addresses (EDID spec). */
+#define DDC_ADDR_EDID               0x50    /* EDID slave */
+#define EDID_BLOCK_LEN              128
+#define EDID_HEADER_MAGIC0          0x00
+#define EDID_HEADER_MAGIC1          0xFF
+
+/* ih_i2cm_stat0 bits */
+#define IH_I2CM_DONE                BIT(1)
+#define IH_I2CM_ERROR               BIT(0)
+
 struct imx8mp_hdmi_data {
 	DEVICE_MMIO_NAMED_RAM(blk_ctrl);
 	DEVICE_MMIO_NAMED_RAM(htx_pvi);
@@ -363,7 +397,7 @@ static void imx8mp_hdmi_pinmux_readback(void)
  * thread so cable plug/unplug events are visible without interrupts.
  */
 #define HDMI_HPD_POLL_MS         250
-#define HDMI_HPD_THREAD_STACKSZ  2048
+#define HDMI_HPD_THREAD_STACKSZ  4096
 #define HDMI_HPD_THREAD_PRIO     10
 
 static K_THREAD_STACK_DEFINE(hdmi_hpd_stack, HDMI_HPD_THREAD_STACKSZ);
@@ -382,33 +416,113 @@ static bool imx8mp_hdmi_hpd_state(const struct device *dev)
 	return (stat0 & HDMI_TX_PHY_STAT0_HPD) != 0;
 }
 
+/*
+ * Sub-goal 2.3: Read 128-byte EDID block 0 from HDMI sink via the DWC HDMI TX
+ * built-in E-DDC I2C master (IMX8MPRM §13.9.3.12, L237109-L237175).
+ *
+ * Protocol:
+ *  1. Soft-reset + configure I2C master.
+ *  2. For each 8-byte chunk (16 chunks × 8 = 128 bytes):
+ *       a. Write i2cm_address = byte offset.
+ *       b. Write i2cm_operation = 0x04 (burst-8 read / rd8).
+ *       c. Wait 3 ms for I2C transaction to complete.
+ *          NOTE: ih_i2cm_stat0 is level-triggered, not W1C-pollable; use
+ *          a fixed delay instead. At 100 kHz, 8 bytes ≈ 1 ms; 3 ms gives
+ *          3× safety margin.
+ *       d. Copy i2cm_read_buff0-7 to output buffer.
+ *  3. Verify EDID checksum (sum of all 128 bytes must be 0x00).
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+static int imx8mp_hdmi_edid_read(const struct device *dev, uint8_t *buf)
+{
+	mm_reg_t hdmi_tx = DEVICE_MMIO_NAMED_GET(dev, hdmi_tx);
+	int i;
+
+	/* (a) Soft-reset the I2C master: write 0 then 1 to i2cm_softrstz. */
+	sys_write8(0x00, hdmi_tx + I2CM_SOFTRSTZ_OFF);
+	k_busy_wait(100);
+	sys_write8(0x01, hdmi_tx + I2CM_SOFTRSTZ_OFF);
+	k_busy_wait(100);
+
+	/* (b) Clear i2cm_int and i2cm_ctlint masks. */
+	sys_write8(0x00, hdmi_tx + I2CM_INT_OFF);
+	sys_write8(0x00, hdmi_tx + I2CM_CTLINT_OFF);
+
+	/* (c) Set DDC slave address = 0x50. */
+	sys_write8(DDC_ADDR_EDID, hdmi_tx + I2CM_SLAVE_OFF);
+
+	/*
+	 * (d) Read 128 bytes as 16 × 8-byte bursts.
+	 *
+	 * ih_i2cm_stat0 is level-triggered: the done bit stays asserted as
+	 * long as the I2C master holds its internal done signal high, so
+	 * W1C polling does not work reliably. Use a fixed delay instead.
+	 * At 100 kHz standard mode, 8 bytes (≈100 I2C bits) takes ~1 ms;
+	 * 3 ms gives 3× safety margin and works for fast-mode too.
+	 */
+	for (i = 0; i < EDID_BLOCK_LEN; i += 8) {
+		sys_write8((uint8_t)i, hdmi_tx + I2CM_ADDRESS_OFF);
+		sys_write8(0x04, hdmi_tx + I2CM_OPERATION_OFF); /* rd8 */
+
+		k_busy_wait(3000); /* 3 ms — let I2C transaction complete */
+
+		/* Copy 8 burst-read bytes from i2cm_read_buff0-7. */
+		for (int j = 0; j < 8; j++) {
+			buf[i + j] = sys_read8(hdmi_tx + I2CM_READ_BUFF_BASE + j);
+		}
+
+		/* Diagnostic: first 2 bursts (header bytes). */
+		if (i < 16) {
+			printk("[hdmi_edid] byte %3d: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			       i,
+			       buf[i+0], buf[i+1], buf[i+2], buf[i+3],
+			       buf[i+4], buf[i+5], buf[i+6], buf[i+7]);
+		}
+	}
+
+	/* (e) Verify EDID checksum: sum of all 128 bytes must be 0x00. */
+	uint8_t sum = 0;
+
+	for (i = 0; i < EDID_BLOCK_LEN; i++) {
+		sum += buf[i];
+	}
+	if (sum != 0) {
+		LOG_WRN("EDID checksum bad (sum=0x%02x)", sum);
+		return -EBADMSG;
+	}
+
+	return 0;
+}
+
 static void imx8mp_hdmi_hpd_thread_fn(void *p1, void *p2, void *p3)
 {
 	const struct device *dev = p1;
+	uint8_t edid[EDID_BLOCK_LEN];
 	bool last;
+	int ret;
 
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
 	printk("[hdmi_hpd] thread started\n");
 
-	{
-		mm_reg_t hdmi_tx = DEVICE_MMIO_NAMED_GET(dev, hdmi_tx);
-
-		printk("[hdmi_hpd] hdmi_tx VA = 0x%lx\n", (unsigned long)hdmi_tx);
-
-		/* sanity: read offset 0 (first register in HDMI TX space) */
-		uint32_t reg0 = sys_read32(hdmi_tx + 0);
-		printk("[hdmi_hpd] hdmi_tx[0] = 0x%08x\n", reg0);
-
-		/* phy_stat0 at offset 0x3004 */
-		uint32_t stat0 = sys_read32(hdmi_tx + HDMI_TX_PHY_STAT0_OFF);
-		printk("[hdmi_hpd] phy_stat0 = 0x%08x  HPD=%d\n",
-		       stat0, (int)!!(stat0 & HDMI_TX_PHY_STAT0_HPD));
-	}
-
 	last = imx8mp_hdmi_hpd_state(dev);
-	printk("[hdmi_hpd] phy_stat0 read ok, HPD=%d\n", (int)last);	LOG_INF("HPD initial state: %s", last ? "on (cable connected)" : "off");
+	LOG_INF("HPD initial state: %s", last ? "on (cable connected)" : "off");
+
+	if (last) {
+		ret = imx8mp_hdmi_edid_read(dev, edid);
+		if (ret == 0) {
+			printk("[hdmi_hpd] Goal 2.3 PASS: EDID read OK\n");
+			printk("[hdmi_hpd] EDID header: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			       edid[0], edid[1], edid[2], edid[3],
+			       edid[4], edid[5], edid[6], edid[7]);
+			printk("[hdmi_hpd] Mfr ID: %02x%02x, Product: %02x%02x\n",
+			       edid[8], edid[9], edid[10], edid[11]);
+		} else {
+			printk("[hdmi_hpd] Goal 2.3 FAIL: EDID read error %d\n", ret);
+		}
+	}
 
 	while (true) {
 		k_msleep(HDMI_HPD_POLL_MS);
@@ -422,6 +536,18 @@ static void imx8mp_hdmi_hpd_thread_fn(void *p1, void *p2, void *p3)
 			       now ? "CONNECTED" : "DISCONNECTED", stat0 & 0xff);
 			LOG_INF("HPD event: %s", now ? "on (cable connected)" : "off (cable removed)");
 			last = now;
+
+			if (now) {
+				ret = imx8mp_hdmi_edid_read(dev, edid);
+				if (ret == 0) {
+					printk("[hdmi_hpd] EDID re-read OK after reconnect\n");
+					printk("[hdmi_hpd] EDID header: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					       edid[0], edid[1], edid[2], edid[3],
+					       edid[4], edid[5], edid[6], edid[7]);
+				} else {
+					printk("[hdmi_hpd] EDID re-read error %d\n", ret);
+				}
+			}
 		}
 	}
 }
