@@ -513,12 +513,40 @@ static void imx8mp_hdmi_hpd_thread_fn(void *p1, void *p2, void *p3)
 	if (last) {
 		ret = imx8mp_hdmi_edid_read(dev, edid);
 		if (ret == 0) {
+			/* Goal 2.4: decode PnP manufacturer ID (bytes 8-9).
+			 * Two bytes in big-endian; each letter = 5 bits, A=1..Z=26.
+			 */
+			uint16_t mfr_raw = ((uint16_t)edid[8] << 8) | edid[9];
+			char mfr[4] = {
+				'A' + ((mfr_raw >> 10) & 0x1F) - 1,
+				'A' + ((mfr_raw >>  5) & 0x1F) - 1,
+				'A' + ((mfr_raw >>  0) & 0x1F) - 1,
+				'\0'
+			};
+			uint16_t product = ((uint16_t)edid[11] << 8) | edid[10];
+
+			/* Goal 2.4: parse preferred timing from first DTD
+			 * (Detailed Timing Descriptor, EDID bytes 54-71).
+			 * Pixel clock: bytes 54-55, little-endian, unit = 10 kHz.
+			 */
+			uint32_t pclk_10khz = ((uint16_t)edid[55] << 8) | edid[54];
+			uint16_t h_active   = ((uint16_t)(edid[58] >> 4) << 8) | edid[56];
+			uint16_t h_blank    = ((uint16_t)(edid[58] & 0x0F) << 8) | edid[57];
+			uint16_t v_active   = ((uint16_t)(edid[61] >> 4) << 8) | edid[59];
+			uint16_t v_blank    = ((uint16_t)(edid[61] & 0x0F) << 8) | edid[60];
+			uint16_t h_total    = h_active + h_blank;
+			uint16_t v_total    = v_active + v_blank;
+			/* refresh = pclk_10khz * 10000 / (h_total * v_total) */
+			uint32_t refresh    = (h_total && v_total)
+				? (pclk_10khz * 10000U / ((uint32_t)h_total * v_total))
+				: 0;
+
 			printk("[hdmi_hpd] Goal 2.3 PASS: EDID read OK\n");
-			printk("[hdmi_hpd] EDID header: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-			       edid[0], edid[1], edid[2], edid[3],
-			       edid[4], edid[5], edid[6], edid[7]);
-			printk("[hdmi_hpd] Mfr ID: %02x%02x, Product: %02x%02x\n",
-			       edid[8], edid[9], edid[10], edid[11]);
+			printk("[hdmi_hpd] Manufacturer : %s  Product: 0x%04x\n",
+			       mfr, product);
+			printk("[hdmi_hpd] Goal 2.4: preferred timing %u x %u @ %u Hz"
+			       "  (pclk=%u kHz)\n",
+			       h_active, v_active, refresh, pclk_10khz * 10);
 		} else {
 			printk("[hdmi_hpd] Goal 2.3 FAIL: EDID read error %d\n", ret);
 		}
@@ -540,10 +568,30 @@ static void imx8mp_hdmi_hpd_thread_fn(void *p1, void *p2, void *p3)
 			if (now) {
 				ret = imx8mp_hdmi_edid_read(dev, edid);
 				if (ret == 0) {
+					uint16_t mfr_raw = ((uint16_t)edid[8] << 8) | edid[9];
+					char mfr[4] = {
+						'A' + ((mfr_raw >> 10) & 0x1F) - 1,
+						'A' + ((mfr_raw >>  5) & 0x1F) - 1,
+						'A' + ((mfr_raw >>  0) & 0x1F) - 1,
+						'\0'
+					};
+					uint16_t product = ((uint16_t)edid[11] << 8) | edid[10];
+					uint32_t pclk_10khz = ((uint16_t)edid[55] << 8) | edid[54];
+					uint16_t h_active   = ((uint16_t)(edid[58] >> 4) << 8) | edid[56];
+					uint16_t v_active   = ((uint16_t)(edid[61] >> 4) << 8) | edid[59];
+					uint16_t h_blank    = ((uint16_t)(edid[58] & 0x0F) << 8) | edid[57];
+					uint16_t v_blank    = ((uint16_t)(edid[61] & 0x0F) << 8) | edid[60];
+					uint32_t refresh    = (h_active + h_blank) && (v_active + v_blank)
+						? (pclk_10khz * 10000U /
+						   ((uint32_t)(h_active + h_blank) * (v_active + v_blank)))
+						: 0;
+
 					printk("[hdmi_hpd] EDID re-read OK after reconnect\n");
-					printk("[hdmi_hpd] EDID header: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-					       edid[0], edid[1], edid[2], edid[3],
-					       edid[4], edid[5], edid[6], edid[7]);
+					printk("[hdmi_hpd] Manufacturer : %s  Product: 0x%04x\n",
+					       mfr, product);
+					printk("[hdmi_hpd] Preferred timing: %u x %u @ %u Hz"
+					       "  (pclk=%u kHz)\n",
+					       h_active, v_active, refresh, pclk_10khz * 10);
 				} else {
 					printk("[hdmi_hpd] EDID re-read error %d\n", ret);
 				}
